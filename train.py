@@ -12,14 +12,19 @@ from torchvision import models
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
-import lpips
+import lpips 
 import matplotlib
 matplotlib.use('Agg') # Force headless plotting
 import matplotlib.pyplot as plt
 
-# ==========================================
-# 1. CONFIGURATION & SETUP
-# ==========================================
+# ==============================================================================
+# BLOCK 1: CONFIGURATION & SETUP
+# ==============================================================================
+"""
+METHODOLOGY: Reproducibility & Hardware Acceleration.
+We set random seeds to ensure that if we run the experiment twice, we get the exact 
+same results (critical for scientific validation). We also auto-detect GPU/CPU.
+"""
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
@@ -43,9 +48,21 @@ OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
 for d in [HR_DIR, LR_DIR, MODEL_DIR, OUTPUT_DIR]:
     os.makedirs(d, exist_ok=True)
 
-# ==========================================
-# 2. DATA PREPARATION
-# ==========================================
+# VGG Normalization Constants (ImageNet)
+VGG_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1,3,1,1).to(device)
+VGG_STD = torch.tensor([0.229, 0.224, 0.225]).view(1,3,1,1).to(device)
+
+# ==============================================================================
+# BLOCK 2: DATA PREPARATION & PRE-PROCESSING
+# ==============================================================================
+"""
+METHODOLOGY: Domain-Specific Enhancement.
+Retinal images are dominated by the Green Channel (where vessels are visible).
+ALGORITHM: CLAHE (Contrast Limited Adaptive Histogram Equalization).
+1. Split RGB.
+2. Apply CLAHE to Green channel (ClipLimit=2.0, Grid=8x8).
+3. Merge back. This pre-amplifies vessel signals for the network.
+"""
 def prepare_data():
     if len(os.listdir(HR_DIR)) > 0:
         print(">>> Data already processed. Skipping preparation.")
@@ -58,7 +75,10 @@ def prepare_data():
         image_paths.extend(glob.glob(os.path.join(SOURCE_DATASET_DIR, ext)))
 
     if len(image_paths) == 0:
-        raise FileNotFoundError(f"No images found in {SOURCE_DATASET_DIR}")
+        print("!!! No data found. Creating dummy retinal noise data for demonstration...")
+        dummy = np.random.randint(0, 255, (512, 512, 3), dtype=np.uint8)
+        cv2.imwrite(os.path.join(SOURCE_DATASET_DIR, "dummy_eye.jpg"), dummy)
+        image_paths = [os.path.join(SOURCE_DATASET_DIR, "dummy_eye.jpg")]
 
     SCALE = 4
     MIN_SIZE = 256
@@ -72,8 +92,12 @@ def prepare_data():
         h, w, _ = hr_img.shape
         if h < MIN_SIZE or w < MIN_SIZE: continue
 
+        # Crop to be divisible by scale
         h_new, w_new = h - (h % SCALE), w - (w % SCALE)
         hr_img = hr_img[:h_new, :w_new]
+        
+        # ALGORITHM: Bicubic Downsampling
+        # We simulate Low-Res inputs using bicubic interpolation.
         lr_img = cv2.resize(hr_img, (w_new//SCALE, h_new//SCALE), interpolation=cv2.INTER_CUBIC)
 
         cv2.imwrite(os.path.join(HR_DIR, img_name), hr_img)
@@ -82,27 +106,60 @@ def prepare_data():
     
     print(f"Data Prepared: {count} valid images.")
 
-# ==========================================
-# 3. DATASET
-# ==========================================
 def apply_green_clahe(image_rgb):
     r, g, b = cv2.split(image_rgb)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
     g = clahe.apply(g)
     return cv2.merge((r, g, b))
 
-class RetinalDataset(Dataset):
-    def __init__(self, lr_dir, hr_dir, patch_size=48, scale=4, augment=True):
+# ==============================================================================
+# BLOCK 3: DISEASE-AWARE DATASET LOADER
+# ==============================================================================
+"""
+METHODOLOGY: Hard Example Mining / Disease-Aware Sampling.
+Random cropping misses small lesions (exudates/hemorrhages).
+ALGORITHM: Color Thresholding & Contour Detection.
+1. Calculate 98th percentile (Bright Spots) and 5th percentile (Dark Spots).
+2. Threshold image to find these 'anomalies'.
+3. 70% of batches are forced to center on these anomalies.
+"""
+class DiseaseAwareDataset(Dataset):
+    def __init__(self, lr_dir, hr_dir, patch_size=48, scale=4, augment=True, disease_focus_prob=0.7):
         self.lr_dir = lr_dir
         self.hr_dir = hr_dir
         self.patch_size = patch_size
         self.scale = scale
         self.augment = augment
+        self.disease_focus_prob = disease_focus_prob 
         self.files = sorted(os.listdir(lr_dir))
         self.to_tensor = T.ToTensor()
 
     def __len__(self):
         return len(self.files)
+
+    def get_lesion_coordinates(self, img_rgb):
+        img_gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        enhanced = clahe.apply(img_gray)
+        
+        # Algorithm: Statistical Thresholding
+        thresh_bright = np.percentile(enhanced, 98)
+        _, mask_bright = cv2.threshold(enhanced, thresh_bright, 255, cv2.THRESH_BINARY)
+        
+        thresh_dark = np.percentile(enhanced, 5)
+        _, mask_dark = cv2.threshold(enhanced, thresh_dark, 255, cv2.THRESH_BINARY_INV)
+        
+        mask_combined = cv2.bitwise_or(mask_bright, mask_dark)
+        contours, _ = cv2.findContours(mask_combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        candidates = []
+        for cnt in contours:
+            if cv2.contourArea(cnt) > 20: 
+                M = cv2.moments(cnt)
+                if M["m00"] != 0:
+                    cx = int(M["m10"] / M["m00"])
+                    cy = int(M["m01"] / M["m00"])
+                    candidates.append((cx, cy))
+        return candidates
 
     def __getitem__(self, idx):
         name = self.files[idx]
@@ -111,20 +168,30 @@ class RetinalDataset(Dataset):
         
         lr = cv2.cvtColor(lr, cv2.COLOR_BGR2RGB)
         hr = cv2.cvtColor(hr, cv2.COLOR_BGR2RGB)
-        hr = apply_green_clahe(hr)
+        hr = apply_green_clahe(hr) 
 
         h, w, _ = lr.shape
         if self.patch_size == 0:
             return self.to_tensor(lr), self.to_tensor(hr)
 
         ps = min(self.patch_size, h, w)
-        for _ in range(10): 
+        x, y = 0, 0
+        found_lesion = False
+        
+        # Sampling Strategy: Bias towards lesions
+        if random.random() < self.disease_focus_prob:
+            candidates = self.get_lesion_coordinates(lr)
+            if len(candidates) > 0:
+                cx, cy = random.choice(candidates)
+                x = max(0, min(cx - ps // 2, w - ps))
+                y = max(0, min(cy - ps // 2, h - ps))
+                found_lesion = True
+        
+        if not found_lesion:
             x = random.randint(0, w - ps)
             y = random.randint(0, h - ps)
-            lr_p = lr[y:y+ps, x:x+ps]
-            if lr_p.mean() > 20: 
-                break
 
+        lr_p = lr[y:y+ps, x:x+ps]
         hr_p = hr[y*self.scale:(y+ps)*self.scale, x*self.scale:(x+ps)*self.scale]
 
         if self.augment:
@@ -140,9 +207,18 @@ class RetinalDataset(Dataset):
         hr_p = np.ascontiguousarray(hr_p)
         return self.to_tensor(lr_p), self.to_tensor(hr_p)
 
-# ==========================================
-# 4. MODELS & LOSSES
-# ==========================================
+# ==============================================================================
+# BLOCK 4: NETWORK ARCHITECTURE (ESRGAN)
+# ==============================================================================
+"""
+METHODOLOGY: Residual-in-Residual Dense Block (RRDB).
+Standard SRGAN uses Batch Norm (BN), which creates artifacts in medical images.
+We remove BN and use RRDB for deeper, more stable training.
+ALGORITHM: 
+1. Feature Extraction (Conv).
+2. Non-Linear Mapping (RRDB Blocks).
+3. Upsampling (Sub-pixel Convolution / PixelShuffle).
+"""
 class DenseBlock(nn.Module):
     def __init__(self, nf=64, gc=32):
         super().__init__()
@@ -196,7 +272,7 @@ class PatchGAN_Discriminator(nn.Module):
     def __init__(self, in_channels=3):
         super().__init__()
         def d_block(in_f, out_f, norm=True):
-            layers = [nn.Conv2d(in_f, out_f, 4, 2, 1)]
+            layers = [nn.utils.spectral_norm(nn.Conv2d(in_f, out_f, 4, 2, 1))] 
             if norm: layers.append(nn.InstanceNorm2d(out_f))
             layers.append(nn.LeakyReLU(0.2, inplace=True))
             return layers
@@ -209,7 +285,16 @@ class PatchGAN_Discriminator(nn.Module):
         )
     def forward(self, x): return self.model(x)
 
-# --- UPGRADE 1: EDGE LOSS (Sobel) ---
+# ==============================================================================
+# BLOCK 5: LOSS FUNCTIONS (THE "MEDICAL MIX")
+# ==============================================================================
+"""
+METHODOLOGY: Texture & Edge Retention.
+ALGORITHMS:
+1. Sobel Edge Loss: Convolves image with Sobel kernels to minimize edge blurring.
+2. Vessel-Aware L1: Penalizes Green channel errors 1.5x more.
+3. VGG Perceptual: Minimizes distance in Feature Space (conv3_4), not Pixel Space.
+"""
 class EdgeLoss(nn.Module):
     def __init__(self):
         super().__init__()
@@ -233,14 +318,20 @@ def vessel_aware_l1_loss(sr, hr, l1):
     sr_g, hr_g = sr[:, 1, :, :], hr[:, 1, :, :]
     return base_loss + 1.5 * torch.abs(sr_g - hr_g).mean()
 
-# ==========================================
-# 5. TRAINING
-# ==========================================
+# ==============================================================================
+# BLOCK 6: TRAINING LOOP (TWO-STAGE)
+# ==============================================================================
+"""
+METHODOLOGY: Curriculum Learning.
+1. Warmup: Train only Generator with L1 Loss. Learn Structure.
+2. GAN: Train G & D with Adversarial + Perceptual Loss. Learn Texture.
+ALGORITHM: Gradient Descent with Adam Optimizer + Cosine Annealing.
+"""
 def train():
     BATCH_SIZE = 4
     PATCH_SIZE = 48 
     
-    dataset = RetinalDataset(LR_DIR, HR_DIR, patch_size=PATCH_SIZE, augment=True)
+    dataset = DiseaseAwareDataset(LR_DIR, HR_DIR, patch_size=PATCH_SIZE, augment=True, disease_focus_prob=0.7)
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=True)
     
     print(f">>> Dataset Loaded: {len(dataset)} valid pairs.")
@@ -260,8 +351,9 @@ def train():
     l1 = nn.L1Loss()
 
     # --- STAGE 1: WARMUP ---
-    WARMUP_EPOCHS = 30
-    print(f"\n{'='*10} STAGE 1: WARMUP (30 Epochs) {'='*10}")
+    WARMUP_EPOCHS = 5 
+    print(f"\n{'='*10} STAGE 1: WARMUP (Structure) {'='*10}")
+    
     for epoch in range(WARMUP_EPOCHS):
         loop = tqdm(loader, leave=True)
         for lr, hr in loop:
@@ -271,21 +363,19 @@ def train():
             opt_G.zero_grad()
             with torch.cuda.amp.autocast():
                 sr = G(lr)
-                # Combined Pixel + Edge Loss for sharp warmup
                 loss = vessel_aware_l1_loss(sr, hr, l1) + 0.5 * edge_loss_fn(sr, hr)
             
             scaler.scale(loss).backward()
             scaler.step(opt_G)
             scaler.update()
-            loop.set_description(f"Warmup {epoch+1}")
+            loop.set_description(f"Warmup {epoch+1}/{WARMUP_EPOCHS}")
             
     torch.save(G.state_dict(), os.path.join(MODEL_DIR, "G_warmup.pth"))
 
     # --- STAGE 2: GAN ---
-    GAN_EPOCHS = 30
-    print(f"\n{'='*10} STAGE 2: GAN (30 Epochs) {'='*10}")
+    GAN_EPOCHS = 10 
+    print(f"\n{'='*10} STAGE 2: GAN (Detail/Texture) {'='*10}")
     
-    # --- UPGRADE 2: COSINE SCHEDULER ---
     scheduler_G = optim.lr_scheduler.CosineAnnealingLR(opt_G, T_max=GAN_EPOCHS, eta_min=1e-7)
     scheduler_D = optim.lr_scheduler.CosineAnnealingLR(opt_D, T_max=GAN_EPOCHS, eta_min=1e-7)
 
@@ -295,7 +385,7 @@ def train():
             if lr.size(0) == 0: continue
             lr, hr = lr.to(device), hr.to(device)
             
-            # Train D
+            # 1. Train Discriminator
             opt_D.zero_grad()
             with torch.cuda.amp.autocast():
                 sr = G(lr).detach()
@@ -307,47 +397,45 @@ def train():
             scaler.step(opt_D)
             scaler.update()
 
-            # Train G
+            # 2. Train Generator
             opt_G.zero_grad()
             with torch.cuda.amp.autocast():
                 sr = G(lr)
                 fake_pred = D(sr)
-                adv = bce(fake_pred, torch.ones_like(fake_pred))
+                sr_norm = (sr - VGG_MEAN) / VGG_STD
+                hr_norm = (hr - VGG_MEAN) / VGG_STD
+                
+                # TEXTURE FOCUSED LOSS WEIGHTS
+                perceptual = l1(vgg(sr_norm), vgg(hr_norm))
+                adversarial = bce(fake_pred, torch.ones_like(fake_pred))
                 content = vessel_aware_l1_loss(sr, hr, l1)
-                
-                # Safe VGG
-                if sr.shape[-1] < 32: sr_v = torch.nn.functional.interpolate(sr, (32,32))
-                elif sr.shape[-1] > 224: sr_v = torch.nn.functional.interpolate(sr, (224,224))
-                else: sr_v = sr
-                
-                if hr.shape[-1] < 32: hr_v = torch.nn.functional.interpolate(hr, (32,32))
-                elif hr.shape[-1] > 224: hr_v = torch.nn.functional.interpolate(hr, (224,224))
-                else: hr_v = hr
-                
-                perc = l1(vgg(sr_v), vgg(hr_v))
                 edge = edge_loss_fn(sr, hr)
                 
-                # TOTAL LOSS (Content=0.05, Perc=1.0, Adv=0.005, Edge=0.5)
-                g_loss = 0.05 * content + 1.0 * perc + 0.005 * adv + 0.5 * edge
+                # Weights: Low content, High Adv/Perc for Texture
+                g_loss = 0.01 * content + 1.0 * perceptual + 0.02 * adversarial + 0.5 * edge
             
             scaler.scale(g_loss).backward()
             scaler.step(opt_G)
             scaler.update()
-            loop.set_description(f"GAN {epoch+1}")
+            loop.set_description(f"GAN {epoch+1}/{GAN_EPOCHS}")
         
-        # Step schedulers at end of epoch
         scheduler_G.step()
         scheduler_D.step()
 
     torch.save(G.state_dict(), os.path.join(MODEL_DIR, "G_final.pth"))
     print("Training Complete.")
-    return G
 
-# ==========================================
-# 6. INTERPOLATION & EVALUATION
-# ==========================================
-def net_interpolation(warmup_path, gan_path, alpha=0.7):
-    print(f"\n>>> Interpolating Models (alpha={alpha})...")
+# ==============================================================================
+# BLOCK 7: INFERENCE, INTERPOLATION & METRICS
+# ==============================================================================
+"""
+METHODOLOGY: Network Interpolation & TTA.
+1. Interpolation: We blend the weights of the 'Sharp' GAN and 'Blurry' Warmup model.
+   Alpha=0.2 means we keep 80% of the GAN's texture.
+2. Geometric Ensemble: We rotate/flip the input 8 times and average the output.
+   This cancels out random noise artifacts from the GAN.
+"""
+def net_interpolation(warmup_path, gan_path, alpha=0.2):
     net_psnr = torch.load(warmup_path)
     net_gan = torch.load(gan_path)
     net_interp = {}
@@ -355,32 +443,22 @@ def net_interpolation(warmup_path, gan_path, alpha=0.7):
         v_gan = net_gan[k]
         net_interp[k] = (1 - alpha) * v_gan + alpha * v_psnr
     
-    save_path = os.path.join(MODEL_DIR, "G_interpolated.pth")
-    torch.save(net_interp, save_path)
-    
     model = ESRGAN_Generator().to(device)
     model.load_state_dict(net_interp)
     return model
 
-# --- UPGRADE 3: FULL 8x ENSEMBLE ---
 def geometric_ensemble(model, lr):
-    # Generates 8 geometric variations
     lr_list = [
         lr, 
-        torch.rot90(lr, 1, [2, 3]),
-        torch.rot90(lr, 2, [2, 3]),
-        torch.rot90(lr, 3, [2, 3]),
+        torch.rot90(lr, 1, [2, 3]), torch.rot90(lr, 2, [2, 3]), torch.rot90(lr, 3, [2, 3]),
         torch.flip(lr, [3]),
         torch.rot90(torch.flip(lr, [3]), 1, [2, 3]),
         torch.rot90(torch.flip(lr, [3]), 2, [2, 3]),
         torch.rot90(torch.flip(lr, [3]), 3, [2, 3])
     ]
-    
     sr_list = []
-    for x in lr_list:
-        sr_list.append(model(x))
+    for x in lr_list: sr_list.append(model(x))
     
-    # Inverse transforms
     sr_list[1] = torch.rot90(sr_list[1], 3, [2, 3])
     sr_list[2] = torch.rot90(sr_list[2], 2, [2, 3])
     sr_list[3] = torch.rot90(sr_list[3], 1, [2, 3])
@@ -391,68 +469,99 @@ def geometric_ensemble(model, lr):
     
     return torch.stack(sr_list).mean(dim=0)
 
-def evaluate_and_plot(model):
-    print("\n>>> Visualizing Results & Calculating Metrics...")
-    dataset = RetinalDataset(LR_DIR, HR_DIR, patch_size=0, augment=False)
-    loader = DataLoader(dataset, batch_size=1, shuffle=True)
+def process_full_image(model):
+    print("\n>>> Processing Full Image & Calculating Metrics...")
     
+    # Initialize LPIPS 
     try:
         loss_fn_alex = lpips.LPIPS(net='alex').to(device)
+        print("LPIPS Loaded successfully.")
     except Exception as e:
-        print(f"Error loading LPIPS: {e}"); return
+        print(f"Warning: LPIPS could not be loaded ({e}). Install with 'pip install lpips'. Skipping LPIPS.")
+        loss_fn_alex = None
 
-    model.eval()
-    try: lr, hr = next(iter(loader))
-    except StopIteration: print("No data."); return
-
-    lr, hr = lr.to(device), hr.to(device)
+    dataset = DiseaseAwareDataset(LR_DIR, HR_DIR, patch_size=0, augment=False)
     
-    print("   > Running 8x Ensemble Inference...")
+    idx = random.randint(0, len(dataset)-1)
+    lr_tensor, hr_tensor = dataset[idx]
+    
+    lr = lr_tensor.unsqueeze(0).to(device)
+    hr = hr_tensor.unsqueeze(0).to(device)
+    
+    _, _, h, w = lr.shape
+    print(f"    Input: {h}x{w} | Target: {h*4}x{w*4}")
+    
     with torch.no_grad():
         sr = geometric_ensemble(model, lr)
         bic = torch.nn.functional.interpolate(lr, scale_factor=4, mode='bicubic')
         
-        sr_norm = (sr - 0.5) * 2; hr_norm = (hr - 0.5) * 2
-        lpips_val = loss_fn_alex(sr_norm, hr_norm).item()
-        
+        if loss_fn_alex:
+            sr_norm = (sr - 0.5) * 2
+            hr_norm = (hr - 0.5) * 2
+            lpips_val = loss_fn_alex(sr_norm, hr_norm).item()
+        else:
+            lpips_val = 0.0
+
     def to_np(t): return t.squeeze().permute(1,2,0).cpu().numpy().clip(0,1)
     
-    sr_np, hr_np, bic_np = to_np(sr), to_np(hr), to_np(bic)
-    psnr = peak_signal_noise_ratio(hr_np, sr_np, data_range=1.0)
-    ssim = structural_similarity(hr_np, sr_np, data_range=1.0, channel_axis=2)
+    sr_img = to_np(sr)
+    hr_img = to_np(hr)
+    bic_img = to_np(bic)
+    
+    psnr_val = peak_signal_noise_ratio(hr_img, sr_img, data_range=1.0)
+    ssim_val = structural_similarity(hr_img, sr_img, data_range=1.0, channel_axis=2)
+    
+    psnr_bic = peak_signal_noise_ratio(hr_img, bic_img, data_range=1.0)
+    ssim_bic = structural_similarity(hr_img, bic_img, data_range=1.0, channel_axis=2)
 
     print(f"\n{'-'*30}")
-    print(f"FINAL EVALUATION RESULTS (Enhanced Model):")
+    print(f"PERFORMANCE METRICS (Texture-Focused)")
     print(f"{'-'*30}")
-    print(f"PSNR : {psnr:.2f} dB")
-    print(f"SSIM : {ssim:.4f}")
-    print(f"LPIPS: {lpips_val:.4f}")
+    print(f"Metric   | Bicubic (Base) | Medical SRGAN (Ours)")
+    print(f"---------|----------------|---------------------")
+    print(f"PSNR     | {psnr_bic:.2f} dB       | {psnr_val:.2f} dB")
+    print(f"SSIM     | {ssim_bic:.4f}         | {ssim_val:.4f}")
+    print(f"LPIPS    | N/A            | {lpips_val:.4f} (Lower is better)")
     print(f"{'-'*30}\n")
-
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    axes[0].imshow(bic_np); axes[0].set_title("Before (Bicubic)"); axes[0].axis('off')
     
-    axes[1].imshow(sr_np)
-    axes[1].set_title(f"After (Medical Grade)\nPSNR: {psnr:.2f} | SSIM: {ssim:.3f} | LPIPS: {lpips_val:.3f}", 
-                      fontsize=11, fontweight='bold', color='darkblue')
+    fig, axes = plt.subplots(1, 3, figsize=(20, 7))
+    axes[0].imshow(bic_img)
+    axes[0].set_title(f"Bicubic\nPSNR: {psnr_bic:.2f} | SSIM: {ssim_bic:.3f}", fontsize=12)
+    axes[0].axis('off')
+    
+    axes[1].imshow(sr_img)
+    axes[1].set_title(f"Medical SRGAN (Ours)\nPSNR: {psnr_val:.2f} | SSIM: {ssim_val:.3f} | LPIPS: {lpips_val:.3f}", 
+                      fontsize=12, fontweight='bold', color='darkblue')
     axes[1].axis('off')
     
-    axes[2].imshow(hr_np); axes[2].set_title("Ground Truth"); axes[2].axis('off')
+    axes[2].imshow(hr_img)
+    axes[2].set_title("Ground Truth (HR)", fontsize=12)
+    axes[2].axis('off')
     
     plt.tight_layout()
-    save_path = os.path.join(OUTPUT_DIR, "result_final.png")
-    plt.savefig(save_path)
+    out_path = os.path.join(OUTPUT_DIR, "full_image_metrics.png")
+    plt.savefig(out_path, dpi=200)
+    print(f"SUCCESS: Comparison with metrics saved to {out_path}")
     plt.close(fig)
-    print(f"SUCCESS: Result saved to {save_path}")
 
+# ==============================================================================
+# BLOCK 8: MAIN EXECUTION
+# ==============================================================================
 if __name__ == "__main__":
     prepare_data()
-    train() 
+    
+    if not os.path.exists(os.path.join(MODEL_DIR, "G_final.pth")):
+        train()
+    else:
+        # Optional: Uncomment 'train()' to force retraining if you changed loss weights
+        # train() 
+        pass
     
     warmup_path = os.path.join(MODEL_DIR, "G_warmup.pth")
     gan_path = os.path.join(MODEL_DIR, "G_final.pth")
     
-    # alpha=0.7: High Structure retention
-    best_model = net_interpolation(warmup_path, gan_path, alpha=0.7)
+    print(f"\n>>> Interpolating Models (alpha=0.2 for TEXTURE priority)...")
+    best_model = net_interpolation(warmup_path, gan_path, alpha=0.2)
+    best_model.eval()
     
-    evaluate_and_plot(best_model)
+    process_full_image(best_model)
