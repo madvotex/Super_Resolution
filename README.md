@@ -1,64 +1,217 @@
-Medical ESRGAN: Clinical-Grade Retinal Image Super-Resolution
-This repository contains a highly specialized adaptation of the Enhanced Super-Resolution Generative Adversarial Network (ESRGAN) designed specifically for medical imaging, with a focus on retinal fundus photography.
+## Medical ESRGAN: Clinical-Grade Retinal Image Super-Resolution
 
-Unlike standard super-resolution models that optimize for photorealistic textures (often resulting in dangerous clinical hallucinations like fake lesions), this architecture strictly optimizes for mathematical structural integrity, capillary preservation, and geometric accuracy.
+A domain-specific adaptation of ESRGAN designed for clinically safe retinal image super-resolution, prioritizing structural fidelity over perceptual realism.
 
-Overview
-The goal of this project is to perform a 4x upscale on low-resolution retinal images while maintaining a Structural Similarity Index (SSIM) suitable for clinical diagnostics. To achieve this, the standard SRGAN pipeline has been heavily modified with curriculum learning, disease-aware sampling, and a custom multi-objective loss function.
+---
 
-Key Clinical Features
-Disease-Aware Hard Example Mining: Retinal images are predominantly empty background. This model uses a custom dataloader featuring CLAHE (Contrast Limited Adaptive Histogram Equalization) and statistical thresholding to force 70% of training batches to center on clinical anomalies (exudates, hemorrhages, or microaneurysms).
+## Overview
 
-Green-Channel Vessel Penalty: Blood vessels absorb green light, making them most visible in the green channel of an RGB image. The loss function applies a 1.5x penalty to errors in the green channel, forcing the network to prioritize vascular sharpness.
+This project implements a 4× super-resolution pipeline for retinal fundus images while ensuring diagnostic reliability. Unlike conventional SRGAN/ESRGAN models that may introduce hallucinated features, this architecture enforces:
 
-Multi-Scale SSIM Hybrid Loss: Replaces standard MSE with a hybrid loss utilizing L1 (pixel intensity), MS-SSIM (structural neighborhood mapping), and Sobel edge detection to prevent the blurring of the optic disc and vessel boundaries.
+- Geometric consistency
 
-Curriculum Learning (Pure L1 Warmup): The generator undergoes an extended 15-epoch warmup using pure L1 loss to learn exact structural mappings before the discriminator is activated, preventing early-stage color corruption.
+- Capillary and vessel preservation
 
-Network Interpolation: The final inference model utilizes weight interpolation (alpha blending). By keeping 80% of the structurally safe L1 warmup weights and only 20% of the GAN's texture weights, the model safely navigates the perception-distortion tradeoff.
+- Clinically meaningful reconstruction
 
-Dynamic Fundus Masking: Evaluation metrics automatically mask out the massive black borders of fundus images, ensuring PSNR and SSIM scores reflect the true accuracy of the biological tissue, not the empty background.
+The model is optimized for high Structural Similarity Index (SSIM) and low distortion, making it suitable for medical analysis workflows.
 
-Requirements
-Python 3.8+
+---
 
-PyTorch (with CUDA support recommended)
+## Motivation
 
-OpenCV (cv2)
+Standard super-resolution models optimize for visual appeal, which can lead to:
 
-scikit-image
+- Fake lesions
 
-LPIPS (pip install lpips)
+- Artificial textures
 
-tqdm
+- Diagnostic misinterpretation
 
-matplotlib
+This project addresses that by enforcing mathematical and structural correctness instead of perceptual sharpness.
 
-Directory Structure
-Upon running the script, the following directory structure will be generated automatically:
+---
 
-Plaintext
+## Key Clinical Features
+- Disease-Aware Hard Example Mining
 
-├── dataset/               # Place your raw high-resolution retinal images here
-├── processed_data/        # Auto-generated HR and downsampled LR pairs
-│   ├── HR/
-│   └── LR/
-├── models/                # Saved Generator and Discriminator weights (.pth)
-├── outputs/               # Visual metric comparisons and evaluation plots
-└── main.py                # The primary execution script
-Usage
-Prepare Data: Place your original retinal images (jpg, png, tif) into the dataset/ directory. If the folder is empty, the script will generate a dummy image for demonstration purposes.
+- Uses CLAHE and statistical thresholding
 
-Execute Pipeline: Run the main script. The script automatically handles data pre-processing (bicubic downsampling), Stage 1 Warmup training, Stage 2 GAN training, and final interpolation.
+- Forces 70% of batches to focus on pathological regions:
 
-Bash
+    - Microaneurysms
 
-python main.py
-Evaluate: Once training is complete, check the outputs/ folder for full_image_metrics_interpolated.png to view a side-by-side comparison of Bicubic vs. Medical SRGAN vs. Ground Truth, along with the masked PSNR, SSIM, and LPIPS metrics.
+    - Hemorrhages
 
-Architecture Details
-Generator: Residual-in-Residual Dense Blocks (RRDB) with Batch Normalization explicitly removed to prevent batch-statistic color shifting in clinical tissues.
+## Exudates
 
-Discriminator: PatchGAN discriminator utilizing spectral normalization to stabilize adversarial training.
+- Green-Channel Vessel Penalty
 
-Adversarial Weighting: The adversarial loss weight is intentionally crippled (0.001) to act as a mild texture sharpener rather than a hallucination engine.
+- Blood vessels are most visible in the green channel
+
+- Loss function applies 1.5× weight to green-channel errors
+
+- Enhances vascular clarity and continuity
+
+## Multi-Scale SSIM Hybrid Loss
+
+Replaces standard MSE with a composite loss:
+
+- L1 Loss for pixel-level accuracy
+
+- MS-SSIM for structural consistency
+
+- Sobel Edge Loss for boundary preservation
+
+Prevents:
+
+- Blurring of optic disc
+
+- Loss of vessel edges
+
+## Curriculum Learning (L1 Warmup)
+
+- First 15 epochs use pure L1 training
+
+- GAN is activated only after stable structure learning
+
+- Prevents hallucinations and color instability
+
+## Network Interpolation
+`Final Weights = 0.8 × L1 Model + 0.2 × GAN Model`
+
+- Maintains structural safety
+
+- Adds controlled texture enhancement
+
+## Dynamic Fundus Masking
+
+- Masks black background during evaluation
+
+- Ensures metrics reflect actual retinal tissue quality
+
+---
+
+## Architecture
+**Generator**
+
+- Residual-in-Residual Dense Blocks (RRDB)
+
+- Batch Normalization removed to prevent color shifts
+
+**Discriminator**
+
+- PatchGAN architecture
+
+- Spectral normalization for stability
+
+**Adversarial Loss**
+
+- Weight = 0.001
+
+- Acts as a refinement mechanism rather than a hallucination driver
+
+---
+
+Project Structure
+- dataset  `  Raw high-resolution retinal images`
+- processed_data       `  Generated HR/LR pairs`
+  - HR
+  - LR
+-  Models                `  Saved model weights (.pth)`
+- outputs               `  Evaluation results and comparisons`
+- main.py                `  Main pipeline script`
+
+---
+
+## Requirements
+
+- Python 3.8+
+
+- PyTorch (CUDA recommended)
+
+- OpenCV (cv2)
+
+- scikit-image
+
+- matplotlib
+
+- tqdm
+
+- LPIPS
+
+**Install dependencies:**
+
+`pip install torch torchvision opencv-python scikit-image matplotlib tqdm lpips`
+
+---
+
+## Usage
+**Prepare Dataset**
+
+Place retinal images in:
+
+`dataset/`
+
+Supported formats:
+
+- .jpg
+
+- .png
+
+- .tif
+
+If empty, a dummy image is automatically generated.
+
+---
+
+## Run Training Pipeline
+`python main.py`
+
+**Pipeline includes:**
+
+- Data preprocessing (bicubic downsampling)
+
+- Stage 1: L1 warmup training
+
+- Stage 2: GAN training
+
+- Model interpolation
+
+- Evaluate Results
+
+**Check:**
+
+`outputs/full_image_metrics_interpolated.png`
+
+**Includes:**
+
+Bicubic vs Model vs Ground Truth
+
+**Metrics:**
+
+- PSNR
+
+- SSIM
+
+- LPIPS
+
+## Evaluation Metrics
+
+- PSNR for signal fidelity
+
+- SSIM for structural similarity (primary metric)
+
+- LPIPS for perceptual difference
+
+All metrics are computed with fundus masking.
+
+## Clinical Disclaimer
+
+This model is designed to assist research and analysis, not replace medical diagnosis.
+
+- Hallucination risk is minimized but not eliminated
+
+- Requires validation before clinical deployment
+
+- Not approved by regulatory authorities
